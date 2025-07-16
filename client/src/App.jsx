@@ -9,7 +9,7 @@ import {
   Loader
 } from 'lucide-react';
 
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = 'https://web-tube-downloader.onrender.com/api';
 
 const validateYouTubeUrl = (url) => {
   const regex = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/;
@@ -229,32 +229,32 @@ const YouTubeDownloader = () => {
             )}
           </button>
         </div>
-      </div>
 
-      {/* Features Section - Single Column */}
-      <div className="grid grid-cols-1 gap-6 mb-8">
-        <div className="bg-white rounded-lg p-6 text-center">
-          <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
-            <Video className="w-6 h-6 text-red-600" />
+        {/* Features Section - Single Column */}
+        <div className="grid grid-cols-1 gap-6 mb-8">
+          <div className="bg-white rounded-lg p-6 text-center">
+            <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <Video className="w-6 h-6 text-red-600" />
+            </div>
+            <h3 className="font-semibold text-gray-800 mb-2">Multiple Formats</h3>
+            <p className="text-sm text-gray-600">Download in MP4, WebM, MP3, and more formats</p>
           </div>
-          <h3 className="font-semibold text-gray-800 mb-2">Multiple Formats</h3>
-          <p className="text-sm text-gray-600">Download in MP4, WebM, MP3, and more formats</p>
-        </div>
 
-        <div className="bg-white rounded-lg p-6 text-center">
-          <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
-            <Settings className="w-6 h-6 text-red-600" />
+          <div className="bg-white rounded-lg p-6 text-center">
+            <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <Settings className="w-6 h-6 text-red-600" />
+            </div>
+            <h3 className="font-semibold text-gray-800 mb-2">Quality Options</h3>
+            <p className="text-sm text-gray-600">Choose from 144p to 4K resolution</p>
           </div>
-          <h3 className="font-semibold text-gray-800 mb-2">Quality Options</h3>
-          <p className="text-sm text-gray-600">Choose from 144p to 4K resolution</p>
-        </div>
 
-        <div className="bg-white rounded-lg p-6 text-center">
-          <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
-            <Download className="w-6 h-6 text-red-600" />
+          <div className="bg-white rounded-lg p-6 text-center">
+            <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <Download className="w-6 h-6 text-red-600" />
+            </div>
+            <h3 className="font-semibold text-gray-800 mb-2">Fast & Secure</h3>
+            <p className="text-sm text-gray-600">Quick processing with secure downloads</p>
           </div>
-          <h3 className="font-semibold text-gray-800 mb-2">Fast & Secure</h3>
-          <p className="text-sm text-gray-600">Quick processing with secure downloads</p>
         </div>
       </div>
     </div>
