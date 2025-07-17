@@ -10,63 +10,94 @@ import certifi
 import darkdetect
 import future
 import packaging
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
+# Configuration
 DOWNLOAD_DIR = 'downloads'
 THUMBNAIL_DIR = 'thumbnails'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 
+# Health check endpoint
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy', 'message': 'YouTube Downloader API is running'})
+
 @app.route('/api/info', methods=['POST'])
 def get_info():
-    url = request.json.get('url')
-    if not url:
-        return jsonify({'error': 'URL is required'}), 400
-
     try:
+        url = request.json.get('url')
+        if not url:
+            return jsonify({'error': 'URL is required'}), 400
+
+        logger.info(f"Getting info for URL: {url}")
+
         ydl_opts = {
             'quiet': True,
             'format': 'bestvideo[height<=2160]+bestaudio/best[height<=2160]'
         }
+        
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
+        # Download and save thumbnail
         thumb_url = info.get('thumbnail')
-        response = requests.get(thumb_url)
-        img = Image.open(BytesIO(response.content))
-        thumb_path = os.path.join(THUMBNAIL_DIR, f"{info['id']}.jpg")
-        img.save(thumb_path)
+        if thumb_url:
+            try:
+                response = requests.get(thumb_url, timeout=10)
+                response.raise_for_status()
+                img = Image.open(BytesIO(response.content))
+                thumb_path = os.path.join(THUMBNAIL_DIR, f"{info['id']}.jpg")
+                img.save(thumb_path)
+                logger.info(f"Thumbnail saved: {thumb_path}")
+            except Exception as e:
+                logger.error(f"Failed to save thumbnail: {e}")
 
         return jsonify({
             'id': info['id'],
             'title': info['title'],
-            'duration': info['duration'],
-            'views': info['view_count'],
+            'duration': info.get('duration', 0),
+            'views': info.get('view_count', 0),
             'thumbnail': f"/api/thumbnail/{info['id']}"
         })
     except Exception as e:
+        logger.error(f"Error in get_info: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/thumbnail/<video_id>', methods=['GET'])
 def get_thumbnail(video_id):
-    path = os.path.join(THUMBNAIL_DIR, f"{video_id}.jpg")
-    if os.path.exists(path):
-        return send_file(path, mimetype='image/jpeg')
-    return jsonify({'error': 'Thumbnail not found'}), 404
+    try:
+        path = os.path.join(THUMBNAIL_DIR, f"{video_id}.jpg")
+        if os.path.exists(path):
+            return send_file(path, mimetype='image/jpeg')
+        return jsonify({'error': 'Thumbnail not found'}), 404
+    except Exception as e:
+        logger.error(f"Error serving thumbnail: {e}")
+        return jsonify({'error': 'Failed to serve thumbnail'}), 500
 
 @app.route('/api/download', methods=['POST'])
 def download():
-    data = request.json
-    url = data.get('url')
-    format = data.get('format', 'mp4')
-    quality_label = data.get('quality', '1080p')
-
-    # Extract numeric height from quality (e.g., '2160p 4K' → '2160')
-    quality = ''.join(filter(str.isdigit, quality_label))
-
     try:
+        data = request.json
+        url = data.get('url')
+        format = data.get('format', 'mp4')
+        quality_label = data.get('quality', '1080p')
+
+        if not url:
+            return jsonify({'error': 'URL is required'}), 400
+
+        logger.info(f"Downloading: {url}, format: {format}, quality: {quality_label}")
+
+        # Extract numeric height from quality (e.g., '2160p 4K' → '2160')
+        quality = ''.join(filter(str.isdigit, quality_label))
+
         # yt-dlp format selector
         if format in ['mp4', 'webm']:
             video_format = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
@@ -93,9 +124,15 @@ def download():
             if format in ['mp3', 'wav']:
                 filename = filename.rsplit('.', 1)[0] + '.' + format
 
-        return send_file(filename, as_attachment=True)
+        if os.path.exists(filename):
+            return send_file(filename, as_attachment=True)
+        else:
+            return jsonify({'error': 'Download failed - file not found'}), 500
+
     except Exception as e:
+        logger.error(f"Error in download: {e}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
