@@ -12,6 +12,8 @@ import future
 import packaging
 import logging
 
+load_dotenv()
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
