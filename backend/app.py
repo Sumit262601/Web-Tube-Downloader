@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
 from PIL import Image
@@ -6,629 +6,374 @@ import os
 import requests
 from io import BytesIO
 import ffmpeg
-import certifi
-import darkdetect
-import future
-import packaging
 import logging
 import json
 import time
 import random
+import re
+import tempfile
+import shutil
+import zipfile
+from urllib.parse import urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Enhanced logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('youtube_downloader.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# Configuration
-DOWNLOAD_DIR = 'downloads'
-THUMBNAIL_DIR = 'thumbnails'
-COOKIES_DIR = 'cookies'
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(THUMBNAIL_DIR, exist_ok=True)
-os.makedirs(COOKIES_DIR, exist_ok=True)
+# Configuration with enhanced settings
+CONFIG = {
+    'DOWNLOAD_DIR': 'downloads',
+    'THUMBNAIL_DIR': 'thumbnails',
+    'COOKIES_DIR': 'cookies',
+    'TEMP_DIR': 'temp',
+    'MAX_CONCURRENT_DOWNLOADS': 3,
+    'DOWNLOAD_TIMEOUT': 300,
+    'MAX_RETRIES': 3,
+    'CHUNK_SIZE': 1024 * 1024,  # 1MB chunks for download
+    'MAX_PLAYLIST_ITEMS': 100,
+    'MAX_BATCH_SIZE': 50,
+    'USER_AGENT_ROTATION': True,
+    'USE_PROXY': False,
+    'PROXY_LIST': [],
+}
 
-# Default user agents to rotate
+# Create necessary directories
+for dir_name in [CONFIG['DOWNLOAD_DIR'], CONFIG['THUMBNAIL_DIR'], 
+                 CONFIG['COOKIES_DIR'], CONFIG['TEMP_DIR']]:
+    os.makedirs(dir_name, exist_ok=True)
+
+# Enhanced user agents with mobile, TV, and smart device variants
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0'
+    # Desktop browsers (updated versions)
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0',
+    
+    # Mobile browsers
+    'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+    
+    # Smart TVs and devices
+    'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.5) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/5.0 Chrome/85.0.4183.93 TV Safari/537.36',
+    'Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.79 Safari/537.36 WebAppManager',
+    
+    # Game consoles
+    'Mozilla/5.0 (PlayStation 5; PlayStation 5/6.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15',
+    
+    # Legacy browsers (for compatibility)
+    'Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; AS; rv:11.0) like Gecko',
 ]
 
-def get_ydl_opts(use_cookies=True, format_selector=None):
-    """Get yt-dlp options with anti-bot measures"""
+# Thread pool for concurrent downloads
+executor = ThreadPoolExecutor(max_workers=CONFIG['MAX_CONCURRENT_DOWNLOADS'])
+
+def get_random_user_agent():
+    """Return a random user agent from the list"""
+    return random.choice(USER_AGENTS) if CONFIG['USER_AGENT_ROTATION'] else USER_AGENTS[0]
+
+def clean_filename(filename):
+    """Sanitize filename to remove invalid characters"""
+    return re.sub(r'[\\/*?:"<>|]', "", filename)
+
+def is_playlist_url(url):
+    """Check if URL is a playlist, channel, or multi-video content"""
+    if not url:
+        return False
     
-    # Base options
+    patterns = [
+        r'list=', r'playlist\?', r'/playlist/', r'/playlists/',
+        r'/channel/', r'/user/', r'/c/', r'/@', r'/videos',
+        r'/streams', r'/shorts', r'/featured'
+    ]
+    
+    return any(re.search(p, url.lower()) for p in patterns)
+
+def get_browser_cookie_path(browser):
+    """Get cookie path for different browsers"""
+    if browser == 'chrome':
+        return ('chrome', None, None, None)
+    elif browser == 'firefox':
+        return ('firefox', None, None, None)
+    elif browser == 'edge':
+        return ('edge', None, None, None)
+    elif browser == 'safari':
+        return ('safari', None, None, None)
+    elif browser == 'opera':
+        return ('opera', None, None, None)
+    elif browser == 'brave':
+        return ('brave', None, None, None)
+    return None
+
+def get_ydl_opts(use_cookies=True, format_selector=None, download=True):
+    """Generate yt-dlp options with enhanced settings"""
     opts = {
         'quiet': True,
-        'no_warnings': True,
-        'user_agent': random.choice(USER_AGENTS),
+        'no_warnings': False,
+        'ignoreerrors': True,
+        'retries': CONFIG['MAX_RETRIES'],
+        'fragment_retries': CONFIG['MAX_RETRIES'],
+        'extractor_retries': CONFIG['MAX_RETRIES'],
+        'socket_timeout': 30,
+        'source_address': '0.0.0.0',
+        'force_ipv4': True,
+        'nocheckcertificate': True,
+        'verbose': False,
+        'http_chunk_size': CONFIG['CHUNK_SIZE'],
+        'extract_flat': False,
+        'concurrent_fragment_downloads': True,
+        'throttledratelimit': 1000000,  # 1MB/s minimum
         'sleep_interval': 1,
-        'max_sleep_interval': 3,
-        'sleep_interval_requests': 1,
-        'sleep_interval_subtitles': 1,
-        'extractor_retries': 3,
-        'fragment_retries': 3,
-        'retry_sleep_functions': {
-            'http': lambda n: min(4 ** n, 60),
-            'fragment': lambda n: min(4 ** n, 60),
-            'extractor': lambda n: min(4 ** n, 60)
+        'max_sleep_interval': 5,
+        'user_agent': get_random_user_agent(),
+        'http_headers': {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Pragma': 'no-cache',
+            'Cache-Control': 'no-cache'
         }
     }
     
-    # Add format selector if provided
+    # Format selection
     if format_selector:
         opts['format'] = format_selector
     else:
         opts['format'] = 'bestvideo[height<=2160]+bestaudio/best[height<=2160]'
     
-    # Add headers to look more like a real browser
-    opts['http_headers'] = {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Cache-Control': 'max-age=0'
-    }
-    
-    # Try to use cookies if available and requested
+    # Cookie handling
     if use_cookies:
-        # First try to use browser cookies
-        for browser in ['chrome', 'firefox', 'edge', 'safari']:
+        # Try browser cookies first
+        for browser in ['chrome', 'firefox', 'edge', 'safari', 'opera', 'brave']:
             try:
-                opts['cookiesfrombrowser'] = (browser, None, None, None)
-                # Test if cookies work by creating a temporary YoutubeDL instance
-                with YoutubeDL(opts) as ydl:
-                    pass
-                logger.info(f"Using cookies from {browser}")
-                break
+                cookie_path = get_browser_cookie_path(browser)
+                if cookie_path:
+                    test_opts = opts.copy()
+                    test_opts['cookiesfrombrowser'] = [cookie_path]
+                    with YoutubeDL(test_opts) as ydl:
+                        ydl.extract_info('https://www.youtube.com', download=False)
+                    opts['cookiesfrombrowser'] = [cookie_path]
+                    logger.info(f"Using cookies from {browser}")
+                    break
             except Exception as e:
                 logger.debug(f"Failed to use {browser} cookies: {e}")
-                if 'cookiesfrombrowser' in opts:
-                    del opts['cookiesfrombrowser']
         
-        # If browser cookies don't work, try cookies.txt file
+        # Fallback to cookies.txt
         if 'cookiesfrombrowser' not in opts:
-            cookies_file = os.path.join(COOKIES_DIR, 'cookies.txt')
+            cookies_file = os.path.join(CONFIG['COOKIES_DIR'], 'cookies.txt')
             if os.path.exists(cookies_file):
                 opts['cookiefile'] = cookies_file
                 logger.info("Using cookies.txt file")
     
+    # Download-specific options
+    if download:
+        opts.update({
+            'outtmpl': os.path.join(CONFIG['DOWNLOAD_DIR'], '%(title)s.%(ext)s'),
+            'noprogress': True,
+            'continuedl': True,
+            'nopart': False,
+            'updatetime': False,
+            'merge_output_format': 'mp4',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
+        })
+    
     return opts
 
-def extract_with_fallback(url, download=False, format_selector=None):
-    """Extract info with multiple fallback strategies"""
-    
-    strategies = [
-        # Strategy 1: Browser cookies + random user agent
-        {'use_cookies': True, 'format_selector': format_selector},
-        
-        # Strategy 2: No cookies, different user agent
-        {'use_cookies': False, 'format_selector': format_selector},
-        
-        # Strategy 3: Simplified format selector
-        {'use_cookies': True, 'format_selector': 'best'},
-        
-        # Strategy 4: Most basic options
-        {'use_cookies': False, 'format_selector': 'best'}
-    ]
-    
-    last_error = None
-    
-    for i, strategy in enumerate(strategies):
-        try:
-            logger.info(f"Trying extraction strategy {i+1}/{len(strategies)}")
-            
-            opts = get_ydl_opts(**strategy)
-            
-            # Add a small delay between attempts
-            if i > 0:
-                time.sleep(random.uniform(1, 3))
-            
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=download)
-                logger.info(f"Success with strategy {i+1}")
-                return info
-                
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Strategy {i+1} failed: {e}")
-            
-            # If it's a bot detection error, try the next strategy
-            if any(keyword in str(e).lower() for keyword in ['bot', 'captcha', 'sign in', 'verify']):
-                continue
-            else:
-                # For other errors, we might want to fail fast
-                raise e
-    
-    # If all strategies failed, raise the last error
-    raise last_error
-
-# Health check endpoint
-@app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'healthy', 'message': 'YouTube Downloader API is running'})
-
-@app.route('/api/upload-cookies', methods=['POST'])
-def upload_cookies():
-    """Upload cookies.txt file"""
+def download_video(url, format='mp4', quality='1080p', retry=0):
+    """Download a single video with enhanced error handling"""
     try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
+        quality_num = int(''.join(filter(str.isdigit, quality)))
+        format_selector = f"bestvideo[height<={quality_num}]+bestaudio/best[height<={quality_num}]"
         
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
+        ydl_opts = get_ydl_opts(format_selector=format_selector)
+        ydl_opts['outtmpl'] = os.path.join(CONFIG['DOWNLOAD_DIR'], '%(title)s.%(ext)s')
         
-        if file and file.filename.endswith('.txt'):
-            cookies_path = os.path.join(COOKIES_DIR, 'cookies.txt')
-            file.save(cookies_path)
-            logger.info(f"Cookies file uploaded: {cookies_path}")
-            return jsonify({'message': 'Cookies uploaded successfully'})
+        if format in ['mp3', 'wav']:
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': format,
+                'preferredquality': '192',
+            }]
         
-        return jsonify({'error': 'Invalid file format. Please upload a .txt file'}), 400
-        
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            
+            if format in ['mp3', 'wav']:
+                filename = os.path.splitext(filename)[0] + f'.{format}'
+            
+            return filename
+    
     except Exception as e:
-        logger.error(f"Error uploading cookies: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Download failed (attempt {retry + 1}): {str(e)}")
+        if retry < CONFIG['MAX_RETRIES']:
+            time.sleep(2 ** retry)  # Exponential backoff
+            return download_video(url, format, quality, retry + 1)
+        raise
 
-@app.route('/api/info', methods=['POST'])
-def get_info():
-    try:
-        url = request.json.get('url')
-        if not url:
-            return jsonify({'error': 'URL is required'}), 400
-
-        logger.info(f"Getting info for URL: {url}")
-
-        # Use the fallback extraction method
-        info = extract_with_fallback(url, download=False)
-
-        # Download and save thumbnail
-        thumb_url = info.get('thumbnail')
-        if thumb_url:
-            try:
-                # Use a proper user agent for thumbnail requests too
-                headers = {
-                    'User-Agent': random.choice(USER_AGENTS),
-                    'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Referer': 'https://www.youtube.com/',
-                    'DNT': '1',
-                    'Connection': 'keep-alive'
-                }
-                
-                response = requests.get(thumb_url, headers=headers, timeout=10)
-                response.raise_for_status()
-                img = Image.open(BytesIO(response.content))
-                thumb_path = os.path.join(THUMBNAIL_DIR, f"{info['id']}.jpg")
-                img.save(thumb_path)
-                logger.info(f"Thumbnail saved: {thumb_path}")
-            except Exception as e:
-                logger.error(f"Failed to save thumbnail: {e}")
-
-        return jsonify({
-            'id': info['id'],
-            'title': info['title'],
-            'duration': info.get('duration', 0),
-            'views': info.get('view_count', 0),
-            'thumbnail': f"/api/thumbnail/{info['id']}"
-        })
-    except Exception as e:
-        logger.error(f"Error in get_info: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/thumbnail/<video_id>', methods=['GET'])
-def get_thumbnail(video_id):
-    try:
-        path = os.path.join(THUMBNAIL_DIR, f"{video_id}.jpg")
-        if os.path.exists(path):
-            return send_file(path, mimetype='image/jpeg')
-        return jsonify({'error': 'Thumbnail not found'}), 404
-    except Exception as e:
-        logger.error(f"Error serving thumbnail: {e}")
-        return jsonify({'error': 'Failed to serve thumbnail'}), 500
-
+# API Endpoints
 @app.route('/api/download', methods=['POST'])
-def download():
+def api_download():
+    """Download single video endpoint"""
     try:
         data = request.json
         url = data.get('url')
         format = data.get('format', 'mp4')
-        quality_label = data.get('quality', '1080p')
-
-        if not url:
-            return jsonify({'error': 'URL is required'}), 400
-
-        logger.info(f"Downloading: {url}, format: {format}, quality: {quality_label}")
-
-        # Extract numeric height from quality (e.g., '2160p 4K' → '2160')
-        quality = ''.join(filter(str.isdigit, quality_label))
-
-        # yt-dlp format selector
-        if format in ['mp4', 'webm']:
-            video_format = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
-        else:
-            video_format = "bestaudio"
-
-        # Get base options
-        ydl_opts = get_ydl_opts(use_cookies=True, format_selector=video_format)
-        
-        # Add download-specific options
-        ydl_opts.update({
-            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-            'merge_output_format': format if format in ['mp4', 'webm'] else None,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': format,
-                'preferredquality': '192',
-            }] if format in ['mp3', 'wav'] else []
-        })
-
-        # Use fallback extraction for download
-        info = extract_with_fallback(url, download=True, format_selector=video_format)
-        
-        # Determine the actual filename
-        with YoutubeDL(ydl_opts) as ydl:
-            filename = ydl.prepare_filename(info)
-
-        # Adjust filename extension for audio-only formats
-        if format in ['mp3', 'wav']:
-            filename = filename.rsplit('.', 1)[0] + '.' + format
-
-        if os.path.exists(filename):
-            return send_file(filename, as_attachment=True)
-        else:
-            return jsonify({'error': 'Download failed - file not found'}), 500
-
-    except Exception as e:
-        logger.error(f"Error in download: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/playlist/info', methods=['POST'])
-def get_playlist_info():
-    """Get playlist information including all videos"""
-    try:
-        data = request.json
-        url = data.get('url')
-        max_videos = data.get('max_videos', 50)  # Limit to prevent overwhelming
+        quality = data.get('quality', '1080p')
         
         if not url:
             return jsonify({'error': 'URL is required'}), 400
-
-        logger.info(f"Getting playlist info for URL: {url}")
-
-        # Check if it's a playlist URL
-        if 'playlist' not in url.lower() and 'channel' not in url.lower() and '/c/' not in url and '/@' not in url:
-            return jsonify({'error': 'URL does not appear to be a playlist or channel'}), 400
-
-        # Get playlist info without downloading
-        opts = get_ydl_opts(use_cookies=True)
-        opts.update({
-            'extract_flat': True,  # Only get video info, don't extract video details
-            'playlistend': max_videos,  # Limit number of videos
-        })
         
-        info = extract_with_fallback(url, download=False, format_selector=None)
+        future = executor.submit(download_video, url, format, quality)
+        filename = future.result(timeout=CONFIG['DOWNLOAD_TIMEOUT'])
         
-        if 'entries' not in info:
-            return jsonify({'error': 'No videos found in playlist'}), 400
-        
-        # Process playlist entries
-        videos = []
-        for entry in info['entries']:
-            if entry:  # Skip unavailable videos
-                videos.append({
-                    'id': entry.get('id'),
-                    'title': entry.get('title', 'Unknown Title'),
-                    'duration': entry.get('duration', 0),
-                    'url': entry.get('url') or f"https://www.youtube.com/watch?v={entry.get('id')}",
-                    'thumbnail': entry.get('thumbnail')
-                })
-        
-        return jsonify({
-            'id': info.get('id'),
-            'title': info.get('title', 'Unknown Playlist'),
-            'description': info.get('description', ''),
-            'uploader': info.get('uploader', 'Unknown'),
-            'video_count': len(videos),
-            'videos': videos
-        })
-        
+        return send_file(filename, as_attachment=True)
+    
     except Exception as e:
-        logger.error(f"Error in get_playlist_info: {e}")
+        logger.error(f"Download error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/playlist/download', methods=['POST'])
-def download_playlist():
-    """Download entire playlist or selected videos"""
+def api_playlist_download():
+    """Download playlist endpoint"""
     try:
         data = request.json
         url = data.get('url')
         format = data.get('format', 'mp4')
-        quality_label = data.get('quality', '1080p')
-        video_indices = data.get('video_indices', None)  # Optional: specific video indices to download
-        max_videos = data.get('max_videos', 25)  # Limit to prevent server overload
-        create_zip = data.get('create_zip', True)  # Whether to zip the results
+        quality = data.get('quality', '1080p')
+        max_items = min(data.get('max_items', 25), CONFIG['MAX_PLAYLIST_ITEMS'])
         
         if not url:
             return jsonify({'error': 'URL is required'}), 400
-
-        logger.info(f"Downloading playlist: {url}, format: {format}, quality: {quality_label}")
-
-        # Extract numeric height from quality
-        quality = ''.join(filter(str.isdigit, quality_label))
-
-        # yt-dlp format selector
-        if format in ['mp4', 'webm']:
-            video_format = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
-        else:
-            video_format = "bestaudio"
-
-        # Create playlist-specific download directory
-        playlist_dir = os.path.join(DOWNLOAD_DIR, f"playlist_{int(time.time())}")
-        os.makedirs(playlist_dir, exist_ok=True)
-
-        # Get base options
-        ydl_opts = get_ydl_opts(use_cookies=True, format_selector=video_format)
         
-        # Add playlist-specific options
-        ydl_opts.update({
-            'outtmpl': os.path.join(playlist_dir, '%(playlist_index)s - %(title)s.%(ext)s'),
-            'merge_output_format': format if format in ['mp4', 'webm'] else None,
-            'playlistend': max_videos,
-            'ignoreerrors': True,  # Continue downloading even if some videos fail
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': format,
-                'preferredquality': '192',
-            }] if format in ['mp3', 'wav'] else []
-        })
+        # First get playlist info
+        ydl_opts = get_ydl_opts(download=False)
+        ydl_opts['extract_flat'] = True
+        ydl_opts['playlistend'] = max_items
         
-        # Add video selection if specified
-        if video_indices:
-            # Convert to playlist item selection
-            playlist_items = ','.join(map(str, video_indices))
-            ydl_opts['playlist_items'] = playlist_items
-
-        # Download the playlist
         with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        # Get list of downloaded files
-        downloaded_files = []
-        for file in os.listdir(playlist_dir):
-            if os.path.isfile(os.path.join(playlist_dir, file)):
-                downloaded_files.append(file)
-
-        if not downloaded_files:
-            return jsonify({'error': 'No files were downloaded'}), 500
-
-        # Create zip file if requested
-        if create_zip:
-            import zipfile
-            zip_filename = f"playlist_{int(time.time())}.zip"
-            zip_path = os.path.join(DOWNLOAD_DIR, zip_filename)
+            info = ydl.extract_info(url, download=False)
             
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for file in downloaded_files:
-                    file_path = os.path.join(playlist_dir, file)
-                    zipf.write(file_path, file)
+            if 'entries' not in info:
+                return jsonify({'error': 'No videos found in playlist'}), 400
             
-            return send_file(zip_path, as_attachment=True, download_name=zip_filename)
-        else:
-            # Return info about downloaded files
-            return jsonify({
-                'message': f'Downloaded {len(downloaded_files)} videos',
-                'files': downloaded_files,
-                'download_dir': playlist_dir
-            })
-
-    except Exception as e:
-        logger.error(f"Error in download_playlist: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/channel/info', methods=['POST'])
-def get_channel_info():
-    """Get channel information and recent videos"""
-    try:
-        data = request.json
-        url = data.get('url')
-        max_videos = data.get('max_videos', 20)
-        
-        if not url:
-            return jsonify({'error': 'URL is required'}), 400
-
-        logger.info(f"Getting channel info for URL: {url}")
-
-        # Ensure it's a channel URL
-        if not any(keyword in url.lower() for keyword in ['channel', '/c/', '/@', '/user/']):
-            return jsonify({'error': 'URL does not appear to be a channel'}), 400
-
-        # Get channel info
-        opts = get_ydl_opts(use_cookies=True)
-        opts.update({
-            'extract_flat': True,
-            'playlistend': max_videos,
-        })
-        
-        info = extract_with_fallback(url, download=False, format_selector=None)
-        
-        # Process channel entries
-        videos = []
-        if 'entries' in info:
+            # Create temp directory for playlist
+            temp_dir = tempfile.mkdtemp(dir=CONFIG['TEMP_DIR'])
+            results = []
+            
+            # Download each video
             for entry in info['entries']:
                 if entry:
-                    videos.append({
-                        'id': entry.get('id'),
-                        'title': entry.get('title', 'Unknown Title'),
-                        'duration': entry.get('duration', 0),
-                        'url': entry.get('url') or f"https://www.youtube.com/watch?v={entry.get('id')}",
-                        'upload_date': entry.get('upload_date'),
-                        'view_count': entry.get('view_count', 0)
-                    })
-        
-        return jsonify({
-            'id': info.get('id'),
-            'title': info.get('title', 'Unknown Channel'),
-            'description': info.get('description', ''),
-            'subscriber_count': info.get('subscriber_count', 0),
-            'video_count': len(videos),
-            'recent_videos': videos
-        })
-        
+                    try:
+                        video_url = entry.get('url') or f"https://www.youtube.com/watch?v={entry.get('id')}"
+                        future = executor.submit(download_video, video_url, format, quality)
+                        filename = future.result(timeout=CONFIG['DOWNLOAD_TIMEOUT'])
+                        results.append(filename)
+                    except Exception as e:
+                        logger.error(f"Failed to download {entry.get('title')}: {str(e)}")
+            
+            # Create zip file
+            zip_filename = os.path.join(CONFIG['DOWNLOAD_DIR'], f"playlist_{int(time.time())}.zip")
+            with zipfile.ZipFile(zip_filename, 'w') as zipf:
+                for file in results:
+                    zipf.write(file, os.path.basename(file))
+            
+            # Clean up
+            for file in results:
+                try:
+                    os.remove(file)
+                except:
+                    pass
+            
+            return send_file(zip_filename, as_attachment=True)
+    
     except Exception as e:
-        logger.error(f"Error in get_channel_info: {e}")
+        logger.error(f"Playlist download error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/batch/download', methods=['POST'])
-def batch_download():
-    """Download multiple individual videos as a batch"""
+def api_batch_download():
+    """Batch download endpoint"""
     try:
         data = request.json
         urls = data.get('urls', [])
         format = data.get('format', 'mp4')
-        quality_label = data.get('quality', '1080p')
-        create_zip = data.get('create_zip', True)
+        quality = data.get('quality', '1080p')
         
-        if not urls or not isinstance(urls, list):
-            return jsonify({'error': 'URLs list is required'}), 400
-
-        if len(urls) > 50:  # Limit batch size
-            return jsonify({'error': 'Maximum 50 URLs allowed per batch'}), 400
-
-        logger.info(f"Batch downloading {len(urls)} videos")
-
-        # Extract numeric height from quality
-        quality = ''.join(filter(str.isdigit, quality_label))
-
-        # yt-dlp format selector
-        if format in ['mp4', 'webm']:
-            video_format = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
-        else:
-            video_format = "bestaudio"
-
-        # Create batch-specific download directory
-        batch_dir = os.path.join(DOWNLOAD_DIR, f"batch_{int(time.time())}")
-        os.makedirs(batch_dir, exist_ok=True)
-
-        # Get base options
-        ydl_opts = get_ydl_opts(use_cookies=True, format_selector=video_format)
+        if not urls or len(urls) > CONFIG['MAX_BATCH_SIZE']:
+            return jsonify({'error': f'URLs list required (max {CONFIG["MAX_BATCH_SIZE"]} items)'}), 400
         
-        # Add batch-specific options
-        ydl_opts.update({
-            'outtmpl': os.path.join(batch_dir, '%(title)s.%(ext)s'),
-            'merge_output_format': format if format in ['mp4', 'webm'] else None,
-            'ignoreerrors': True,  # Continue downloading even if some videos fail
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': format,
-                'preferredquality': '192',
-            }] if format in ['mp3', 'wav'] else []
-        })
-
-        # Download all URLs
-        successful_downloads = []
-        failed_downloads = []
+        # Create temp directory for batch
+        temp_dir = tempfile.mkdtemp(dir=CONFIG['TEMP_DIR'])
+        results = []
+        futures = []
         
-        with YoutubeDL(ydl_opts) as ydl:
-            for url in urls:
-                try:
-                    logger.info(f"Downloading: {url}")
-                    ydl.download([url])
-                    successful_downloads.append(url)
-                except Exception as e:
-                    logger.error(f"Failed to download {url}: {e}")
-                    failed_downloads.append({'url': url, 'error': str(e)})
-
-        # Get list of downloaded files
-        downloaded_files = []
-        for file in os.listdir(batch_dir):
-            if os.path.isfile(os.path.join(batch_dir, file)):
-                downloaded_files.append(file)
-
-        if not downloaded_files:
-            return jsonify({'error': 'No files were downloaded'}), 500
-
-        # Create zip file if requested
-        if create_zip:
-            import zipfile
-            zip_filename = f"batch_{int(time.time())}.zip"
-            zip_path = os.path.join(DOWNLOAD_DIR, zip_filename)
-            
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for file in downloaded_files:
-                    file_path = os.path.join(batch_dir, file)
-                    zipf.write(file_path, file)
-            
-            return send_file(zip_path, as_attachment=True, download_name=zip_filename)
-        else:
-            # Return info about downloaded files
-            return jsonify({
-                'message': f'Downloaded {len(downloaded_files)} out of {len(urls)} videos',
-                'successful_downloads': len(successful_downloads),
-                'failed_downloads': len(failed_downloads),
-                'files': downloaded_files,
-                'errors': failed_downloads
-            })
-
-    except Exception as e:
-        logger.error(f"Error in batch_download: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/status', methods=['GET'])
-def get_status():
-    """Get API status and available features"""
-    try:
-        # Check if cookies are available
-        cookies_available = []
-        for browser in ['chrome', 'firefox', 'edge', 'safari']:
+        # Submit all downloads
+        for url in urls:
+            futures.append(executor.submit(download_video, url, format, quality))
+        
+        # Collect results
+        for future in futures:
             try:
-                opts = {'cookiesfrombrowser': (browser, None, None, None), 'quiet': True}
-                with YoutubeDL(opts) as ydl:
-                    pass
-                cookies_available.append(browser)
+                filename = future.result(timeout=CONFIG['DOWNLOAD_TIMEOUT'])
+                results.append(filename)
+            except Exception as e:
+                logger.error(f"Batch download failed for a URL: {str(e)}")
+        
+        # Create zip file
+        zip_filename = os.path.join(CONFIG['DOWNLOAD_DIR'], f"batch_{int(time.time())}.zip")
+        with zipfile.ZipFile(zip_filename, 'w') as zipf:
+            for file in results:
+                zipf.write(file, os.path.basename(file))
+        
+        # Clean up
+        for file in results:
+            try:
+                os.remove(file)
             except:
                 pass
         
-        cookies_file_exists = os.path.exists(os.path.join(COOKIES_DIR, 'cookies.txt'))
-        
-        return jsonify({
-            'status': 'healthy',
-            'cookies': {
-                'browser_cookies_available': cookies_available,
-                'cookies_file_exists': cookies_file_exists
-            },
-            'features': [
-                'Single video download',
-                'Playlist download',
-                'Channel video download',
-                'Batch download',
-                'Multiple format support',
-                'Quality selection',
-                'Zip packaging'
-            ],
-            'anti_bot_features': [
-                'User agent rotation',
-                'Request delays',
-                'Retry mechanisms',
-                'Browser cookie support',
-                'Custom headers'
-            ]
-        })
+        return send_file(zip_filename, as_attachment=True)
+    
     except Exception as e:
-        logger.error(f"Error in status check: {e}")
+        logger.error(f"Batch download error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    """Service status endpoint"""
+    return jsonify({
+        'status': 'running',
+        'config': CONFIG,
+        'statistics': {
+            'downloads_dir_size': f"{sum(os.path.getsize(f) for f in os.listdir(CONFIG['DOWNLOAD_DIR']) if os.path.isfile(f)) / (1024*1024):.2f} MB",
+            'thumbnails_count': len(os.listdir(CONFIG['THUMBNAIL_DIR'])),
+            'active_downloads': executor._work_queue.qsize(),
+            'max_concurrent_downloads': CONFIG['MAX_CONCURRENT_DOWNLOADS']
+        }
+    })
+
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=5000, threaded=True)
