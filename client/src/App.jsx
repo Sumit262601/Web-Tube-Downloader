@@ -12,7 +12,8 @@ import {
 import toast, { Toaster } from 'react-hot-toast';
 import { Footer } from './components/Footer';
 
-const API_BASE = 'http://127.0.0.1:5000/api';
+const API_BASE = 'https://next-tube-5hi0.onrender.com/api';
+// const API_BASE = process.env.REACT_API_BASE;
 
 const validateYouTubeUrl = (url) => {
   const regex = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/;
