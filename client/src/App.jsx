@@ -15,7 +15,8 @@ import {
   ChevronUp
 } from 'lucide-react';
 
-const API_BASE = 'http://localhost:5000/api';
+// const API_BASE = 'http://localhost:5000/api';
+const API_BASE = 'https://next-tube-5hi0.onrender.com/api';
 
 const validateYouTubeUrl = (url) => {
   const regex = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/;
