@@ -4,7 +4,6 @@ import DownloaderForm from './components/DownloaderForm';
 import FeaturesSection from './components/FeaturesSection';
 import Footer from './components/Footer';
 import Navigation from './components/Navigation';
-import { Routes } from "react-router"
 
 function App() {
   return (
